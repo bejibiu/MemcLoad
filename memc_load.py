@@ -22,7 +22,7 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
+def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False, timeout=3):
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
     ua.lon = appsinstalled.lon
@@ -35,7 +35,7 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
         if dry_run:
             logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
         else:
-            memc = memcache.Client([memc_addr])
+            memc = memcache.Client([memc_addr], socket_timeout=timeout)
             memc.set(key, packed)
     except Exception as e:
         logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
@@ -86,7 +86,7 @@ def main(options):
                 errors += 1
                 logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                 continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
+            ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry, options.timeout)
             if ok:
                 processed += 1
             else:
@@ -127,6 +127,8 @@ if __name__ == '__main__':
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
     op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
+    op.add_option("--timeout", action="store", default=3, type="int",
+                  help='timeout in seconds for all calls to a server memcached. Defaults to 3 seconds.')
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
