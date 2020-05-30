@@ -27,23 +27,24 @@ class ProcessedLine(Thread):
 
     def run(self):
         while True:
-            line = self.queue.get()
-            if isinstance(line, str) and line == "quit":
+            lines = self.queue.get()
+            if isinstance(lines, str) and lines == "quit":
                 break
-            appsinstalled = ProcessedLine.parse_appsinstalled(line)
-            if not appsinstalled:
-                self.errors += 1
-                continue
-            memc = self.device_memc.get(appsinstalled.dev_type)
-            if not memc:
-                self.errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                continue
-            ok = ProcessedLine.insert_appsinstalled(memc, appsinstalled, self.dry, self.timeout, self.retry)
-            if ok:
-                self.processed += 1
-            else:
-                self.errors += 1
+            for line in lines:
+                appsinstalled = ProcessedLine.parse_appsinstalled(line)
+                if not appsinstalled:
+                    self.errors += 1
+                    continue
+                memc = self.device_memc.get(appsinstalled.dev_type)
+                if not memc:
+                    self.errors += 1
+                    logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+                    continue
+                ok = ProcessedLine.insert_appsinstalled(memc, appsinstalled, self.dry, self.timeout, self.retry)
+                if ok:
+                    self.processed += 1
+                else:
+                    self.errors += 1
             self.queue.task_done()
 
     @staticmethod
@@ -148,11 +149,24 @@ def run_filler_thread(fd, queue):
 
 
 def filler_line(fd, queue):
+    lines = generate_chunk(fd)
+    for line_chunk in lines:
+        queue.put(line_chunk)
+
+
+def generate_chunk(fd, chunk_size=100):
+    lines = []
     for line in fd:
         line = line.strip().decode()
         if not line:
             continue
-        queue.put(line)
+        lines.append(line)
+        if len(lines) >= chunk_size:
+            yield lines
+            lines = []
+    yield lines
+
+
 
 
 def prototest():
@@ -181,6 +195,8 @@ if __name__ == '__main__':
                   help='timeout in seconds for all calls to a server memcached. Defaults to 3 seconds.')
     op.add_option("--retry", action="store", default=3, type="int",
                   help='retry connection to set value to memcached. Defaults to 3 attempts')
+    op.add_option("--chunk-size", action="store", default=10, type="int",
+                  help="number of lines to process per thread")
     op.add_option("--num-workers", action="store", default=5, type="int")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")

@@ -1,5 +1,6 @@
 from queue import Queue
 
+import memcache
 import pytest
 
 
@@ -15,15 +16,15 @@ def queue():
 
 @pytest.fixture
 def sample_queue(sample, queue):
-    [queue.put(i) for i in sample.splitlines()]
+    [queue.put([i]) for i in sample.splitlines()]
     return queue
 
 
 @pytest.fixture
 def device_memc():
     return {
-        "idfa": "127.0.0.1:33013",
-        "gaid": "127.0.0.1:33014",
-        "adid": "127.0.0.1:33015",
-        "dvid": "127.0.0.1:33016",
+        "idfa": memcache.Client(["127.0.0.1:33013"]),
+        "gaid": memcache.Client(["127.0.0.1:33014"]),
+        "adid": memcache.Client(["127.0.0.1:33015"]),
+        "dvid": memcache.Client(["127.0.0.1:33016"]),
     }
