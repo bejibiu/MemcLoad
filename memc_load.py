@@ -5,15 +5,93 @@ import glob
 import logging
 import collections
 from optparse import OptionParser
-# brew install protobuf
-# protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
+from queue import Queue
+from threading import Thread
+
 import appsinstalled_pb2
-# pip install python-memcached
 import memcache
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+
+
+class ProcessedLine(Thread):
+    def __init__(self, device_memc, queue, options=None):
+        super().__init__()
+        self.queue: Queue = queue
+        self.timeout = 3 if not options else options.timeout
+        self.device_memc = device_memc
+        self.retry = 1 if not options else options.retry
+        self.dry = False if not options else options.dry
+        self.processed = self.errors = 0
+
+    def run(self):
+        while True:
+            line = self.queue.get()
+            if isinstance(line, str) and line == "quit":
+                break
+            appsinstalled = ProcessedLine.parse_appsinstalled(line)
+            if not appsinstalled:
+                self.errors += 1
+                continue
+            memc_addr = self.device_memc.get(appsinstalled.dev_type)
+            if not memc_addr:
+                self.errors += 1
+                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+                continue
+            ok = insert_appsinstalled(memc_addr, appsinstalled, self.dry, self.timeout, self.retry)
+            if ok:
+                self.processed += 1
+            else:
+                self.errors += 1
+            self.queue.task_done()
+
+    @staticmethod
+    def parse_appsinstalled(line):
+        line_parts = line.strip().split("\t")
+        if len(line_parts) < 5:
+            return
+        dev_type, dev_id, lat, lon, raw_apps = line_parts
+        if not dev_type or not dev_id:
+            return
+        try:
+            apps = [int(a.strip()) for a in raw_apps.split(",")]
+        except ValueError:
+            apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
+            logging.info("Not all user apps are digits: `%s`" % line)
+        try:
+            lat, lon = float(lat), float(lon)
+        except ValueError:
+            logging.info("Invalid geo coords: `%s`" % line)
+        return AppsInstalled(dev_type, dev_id, lat, lon, apps)
+
+    @staticmethod
+    def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False, timeout=3, retry_connection=3):
+        retry_connection_ = retry_connection
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+        # @TODO persistent connection
+        # @TODO retry and timeouts!
+        try:
+            if dry_run:
+                logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+            else:
+                memc = memcache.Client([memc_addr], socket_timeout=timeout)
+                result = memc.set(key, packed)
+                while not result and retry_connection_ > 0:
+                    logging.info(f"set failed. {retry_connection_} attempts left")
+                    result = memc.set(key, packed)
+                    retry_connection_ -= 1
+                if not retry_connection_:
+                    logging.info(f"set failed. for {memc_addr}")
+                return result
+        except Exception as e:
+            logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+            return False
 
 
 def dot_rename(path):
@@ -22,54 +100,8 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False, timeout=3, retry_connection=3):
-    retry_connection_ = retry_connection
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr], socket_timeout=timeout)
-            result = memc.set(key, packed)
-            while not result and retry_connection_ > 0:
-                logging.info(f"set failed. {retry_connection_} attempts left")
-                result = memc.set(key, packed)
-                retry_connection_ -= 1
-            if not retry_connection_:
-                logging.info(f"set failed. for {memc_addr}")
-            return result
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-
-
-def parse_appsinstalled(line):
-    line_parts = line.strip().split("\t")
-    if len(line_parts) < 5:
-        return
-    dev_type, dev_id, lat, lon, raw_apps = line_parts
-    if not dev_type or not dev_id:
-        return
-    try:
-        apps = [int(a.strip()) for a in raw_apps.split(",")]
-    except ValueError:
-        apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-        logging.info("Not all user apps are digits: `%s`" % line)
-    try:
-        lat, lon = float(lat), float(lon)
-    except ValueError:
-        logging.info("Invalid geo coords: `%s`" % line)
-    return AppsInstalled(dev_type, dev_id, lat, lon, apps)
-
-
 def main(options):
+    queue = Queue()
     device_memc = {
         "idfa": options.idfa,
         "gaid": options.gaid,
@@ -77,27 +109,17 @@ def main(options):
         "dvid": options.dvid,
     }
     for fn in glob.iglob(options.pattern):
-        processed = errors = 0
         logging.info('Processing %s' % fn)
+        workers = start_workers(device_memc, options, queue)
         fd = gzip.open(fn)
-        for line in fd:
-            line = line.strip().decode()
-            if not line:
-                continue
-            appsinstalled = parse_appsinstalled(line)
-            if not appsinstalled:
-                errors += 1
-                continue
-            memc_addr = device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
-                errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry, options.timeout, options.retry)
-            if ok:
-                processed += 1
-            else:
-                errors += 1
+        run_filler_thread(fd, queue)
+        for _ in workers:
+            queue.put('quit')
+        for w in workers:
+            w.join()
+
+        errors = sum(w.errors for w in workers)
+        processed = sum(w.processed for w in workers)
         if not processed:
             fd.close()
             dot_rename(fn)
@@ -110,6 +132,29 @@ def main(options):
             logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
         fd.close()
         dot_rename(fn)
+
+
+def start_workers(device_memc, options, queue):
+    workers = []
+    for _ in range(options.num_workers):
+        worker = ProcessedLine(device_memc, queue, options)
+        worker.start()
+        workers.append(worker)
+    return workers
+
+
+def run_filler_thread(fd, queue):
+    thread_filler = Thread(target=filler_line, args=(fd, queue), name='filler')
+    thread_filler.start()
+    thread_filler.join()
+
+
+def filler_line(fd, queue):
+    for line in fd:
+        line = line.strip().decode()
+        if not line:
+            continue
+        queue.put(line)
 
 
 def prototest():
@@ -138,13 +183,14 @@ if __name__ == '__main__':
                   help='timeout in seconds for all calls to a server memcached. Defaults to 3 seconds.')
     op.add_option("--retry", action="store", default=3, type="int",
                   help='retry connection to set value to memcached. Defaults to 3 attempts')
+    op.add_option("--num-workers", action="store", default=5, type="int")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
-                        format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
+                        format='[%(asctime)s] %(threadName)s %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)

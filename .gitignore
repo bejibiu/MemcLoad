@@ -4,4 +4,4 @@ venv
 py[cod]
 __pycache__
 data
-
+.pytest_cache
