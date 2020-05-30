@@ -34,12 +34,12 @@ class ProcessedLine(Thread):
             if not appsinstalled:
                 self.errors += 1
                 continue
-            memc_addr = self.device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
+            memc = self.device_memc.get(appsinstalled.dev_type)
+            if not memc:
                 self.errors += 1
                 logging.error("Unknow device type: %s" % appsinstalled.dev_type)
                 continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, self.dry, self.timeout, self.retry)
+            ok = ProcessedLine.insert_appsinstalled(memc, appsinstalled, self.dry, self.timeout, self.retry)
             if ok:
                 self.processed += 1
             else:
@@ -66,21 +66,19 @@ class ProcessedLine(Thread):
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
     @staticmethod
-    def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False, timeout=3, retry_connection=3):
+    def insert_appsinstalled(memc, appsinstalled, dry_run=False, timeout=3, retry_connection=3):
         retry_connection_ = retry_connection
+        memc_addr = str(memc.servers[0])
         ua = appsinstalled_pb2.UserApps()
         ua.lat = appsinstalled.lat
         ua.lon = appsinstalled.lon
         key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
         ua.apps.extend(appsinstalled.apps)
         packed = ua.SerializeToString()
-        # @TODO persistent connection
-        # @TODO retry and timeouts!
         try:
             if dry_run:
                 logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
             else:
-                memc = memcache.Client([memc_addr], socket_timeout=timeout)
                 result = memc.set(key, packed)
                 while not result and retry_connection_ > 0:
                     logging.info(f"set failed. {retry_connection_} attempts left")
@@ -103,10 +101,10 @@ def dot_rename(path):
 def main(options):
     queue = Queue()
     device_memc = {
-        "idfa": options.idfa,
-        "gaid": options.gaid,
-        "adid": options.adid,
-        "dvid": options.dvid,
+        "idfa": memcache.Client([options.idfa], socket_timeout=options.timeout),
+        "gaid": memcache.Client([options.gaid], socket_timeout=options.timeout),
+        "adid": memcache.Client([options.adid], socket_timeout=options.timeout),
+        "dvid": memcache.Client([options.dvid], socket_timeout=options.timeout),
     }
     for fn in glob.iglob(options.pattern):
         logging.info('Processing %s' % fn)

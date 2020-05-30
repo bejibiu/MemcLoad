@@ -1,0 +1,21 @@
+version: "3"
+services: 
+    gaid:
+        image: memcached:latest
+    idfa:
+        image: memcached:latest
+    adid:
+        image: memcached:latest
+    dvid:
+        image: memcached:latest
+
+    
+    client:
+        container_name: memc_load
+        build: .
+        command: python memc_load.py --gaid="gaid:11211" --idfa="idfa:11211" --adid="adid:11211"  --dvid="dvid:11211"
+        depends_on:
+            - gaid
+            - idfa
+            - adid
+            - dvid
