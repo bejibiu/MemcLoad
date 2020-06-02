@@ -22,7 +22,7 @@ class ParseAppsLogThread(Thread):
         super().__init__(*args, **kwargs)
         self.raw_queue = raw_queue
         self.processed = self.errors = 0
-        self.parsed_queue: Queue = parsed_queue
+        self.parsed_queue = parsed_queue
 
     def run(self):
         while True:
@@ -63,7 +63,7 @@ class ParseAppsLogThread(Thread):
 class SenderToMemcThread(Thread):
     def __init__(self, device_memc, queue, options=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.queue: Queue = queue
+        self.queue = queue
         self.timeout = 3 if not options else options.timeout
         self.device_memc = device_memc
         self.retry = 1 if not options else options.retry
