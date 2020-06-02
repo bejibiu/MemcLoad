@@ -75,37 +75,43 @@ class SenderToMemcThread(Thread):
             appsinstalleds = self.queue.get()
             if isinstance(appsinstalleds, str) and appsinstalleds == "quit":
                 break
-            for appsinstalled in appsinstalleds:
-                memc = self.device_memc.get(appsinstalled.dev_type)
+            appsinstalleds.sort(key=lambda x: x.dev_type)
+            for dev_type, appsinstalleds_group in itertools.groupby(appsinstalleds, lambda x: x.dev_type):
+                memc = self.device_memc.get(dev_type)
                 if not memc:
-                    self.errors += 1
-                    logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+                    self.errors += len(list(appsinstalleds_group))
+                    logging.error("Unknown device type: %s" % dev_type)
                     continue
-                ok = SenderToMemcThread.insert_appsinstalled(memc, appsinstalled, self.dry, self.timeout, self.retry)
+                ok = SenderToMemcThread.insert_appsinstalled(memc, appsinstalleds_group, self.dry, self.timeout, self.retry)
                 if ok:
-                    self.processed += 1
+                    self.processed += len(list(appsinstalleds_group))
                 else:
-                    self.errors += 1
+                    self.errors += len(list(appsinstalleds_group))
             self.queue.task_done()
 
     @staticmethod
-    def insert_appsinstalled(memc, appsinstalled, dry_run=False, timeout=3, retry_connection=3):
+    def insert_appsinstalled(memc, appsinstalleds_group, dry_run=False, timeout=3, retry_connection=3):
         retry_connection_ = retry_connection
         memc_addr = str(memc.servers[0])
-        ua = appsinstalled_pb2.UserApps()
-        ua.lat = appsinstalled.lat
-        ua.lon = appsinstalled.lon
-        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-        ua.apps.extend(appsinstalled.apps)
-        packed = ua.SerializeToString()
+        packeds = {}
+        for appsinstalled in appsinstalleds_group:
+            ua = appsinstalled_pb2.UserApps()
+            ua.lat = appsinstalled.lat
+            ua.lon = appsinstalled.lon
+            key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+            ua.apps.extend(appsinstalled.apps)
+            packed = ua.SerializeToString()
+            packeds[key] = packed
         try:
             if dry_run:
-                logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+                logging.debug("send nex group:")
+                for key in packeds:
+                    logging.debug("%s - %s" % (memc_addr, key))
             else:
-                result = memc.set(key, packed)
+                result = memc.set_multi(packeds)
                 while not result and retry_connection_ > 0:
                     logging.info(f"set failed. {retry_connection_} attempts left")
-                    result = memc.set(key, packed)
+                    result = memc.set_multi(packeds)
                     retry_connection_ -= 1
                 if not retry_connection_:
                     logging.info(f"set failed. for {memc_addr}")
