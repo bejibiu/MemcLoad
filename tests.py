@@ -1,21 +1,23 @@
-from memc_load import ProcessedLine, generate_chunk
+from queue import Queue
+
+from memc_load import SenderToMemcThread, generate_chunk, ParseAppsLogThread
 
 
-class TestsThreadClass:
-    def test_thread_processed(self, device_memc, sample_queue):
-        size_queue = sample_queue.qsize()
-        sample_queue.put('quit')
-        thread = ProcessedLine(device_memc, sample_queue)
+class TestsSenderToMemcThreadClass:
+    def test_thread_sender(self, device_memc, parsed_queue):
+        size_queue = parsed_queue.qsize()
+        parsed_queue.put('quit')
+        thread = SenderToMemcThread(device_memc, parsed_queue)
         thread.start()
         thread.join()
         assert sum((thread.errors, thread.processed)) == size_queue
 
-    def test_pool_thread_processed(self, device_memc, sample_queue):
-        size_queue = sample_queue.qsize()
-        sample_queue.put('quit')
-        sample_queue.put('quit')
-        thread = ProcessedLine(device_memc, sample_queue)
-        thread2 = ProcessedLine(device_memc, sample_queue)
+    def test_pool_thread_sender(self, device_memc, parsed_queue):
+        size_queue = parsed_queue.qsize()
+        parsed_queue.put('quit')
+        parsed_queue.put('quit')
+        thread = SenderToMemcThread(device_memc, parsed_queue)
+        thread2 = SenderToMemcThread(device_memc, parsed_queue)
         thread.start()
         thread2.start()
         thread.join()
@@ -54,3 +56,37 @@ class TestsFiller:
             lines = [i for i in gen]
         assert len(lines) == 1
         assert sum(len(i) for i in lines) == 1
+
+
+class TestParsedThread:
+    def test_fill_out_queue(self, sample_queue):
+        parsed_queue = Queue()
+        sample_queue.put('quit')
+        size_queue = sample_queue.qsize()
+
+        thread = ParseAppsLogThread(sample_queue, parsed_queue)
+        thread.start()
+        thread.join()
+
+        assert parsed_queue.qsize() == size_queue
+
+    def test_right_error_size_parsed_queue(self, sample_queue):
+        parsed_queue = Queue()
+        sample_queue.put(['error =('])
+        sample_queue.put('quit')
+
+        thread = ParseAppsLogThread(sample_queue, parsed_queue)
+        thread.start()
+        thread.join()
+        assert thread.errors == 1
+
+    def test_right_all_size_parsed_queue(self, sample_queue):
+        parsed_queue = Queue()
+        sample_queue.put(['error =('])
+        sample_queue.put('quit')
+        size_queue = sample_queue.qsize()
+
+        thread = ParseAppsLogThread(sample_queue, parsed_queue)
+        thread.start()
+        thread.join()
+        assert sum((thread.errors, parsed_queue.qsize())) == size_queue

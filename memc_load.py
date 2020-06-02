@@ -1,3 +1,4 @@
+import itertools
 import os
 import gzip
 import sys
@@ -13,39 +14,31 @@ import memcache
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+PipeLinesApps = collections.namedtuple("PipeLinesApps", ["parsed_threads", "sender_threads"], defaults=([], []))
 
 
-class ProcessedLine(Thread):
-    def __init__(self, device_memc, queue, options=None):
-        super().__init__()
-        self.queue: Queue = queue
-        self.timeout = 3 if not options else options.timeout
-        self.device_memc = device_memc
-        self.retry = 1 if not options else options.retry
-        self.dry = False if not options else options.dry
+class ParseAppsLogThread(Thread):
+    def __init__(self, raw_queue, parsed_queue, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raw_queue = raw_queue
         self.processed = self.errors = 0
+        self.parsed_queue: Queue = parsed_queue
 
     def run(self):
         while True:
-            lines = self.queue.get()
+            lines = self.raw_queue.get()
+            parsed_lines = []
             if isinstance(lines, str) and lines == "quit":
+                self.parsed_queue.put(lines)
                 break
             for line in lines:
-                appsinstalled = ProcessedLine.parse_appsinstalled(line)
+                appsinstalled = ParseAppsLogThread.parse_appsinstalled(line)
                 if not appsinstalled:
                     self.errors += 1
                     continue
-                memc = self.device_memc.get(appsinstalled.dev_type)
-                if not memc:
-                    self.errors += 1
-                    logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                    continue
-                ok = ProcessedLine.insert_appsinstalled(memc, appsinstalled, self.dry, self.timeout, self.retry)
-                if ok:
-                    self.processed += 1
-                else:
-                    self.errors += 1
-            self.queue.task_done()
+                parsed_lines.append(appsinstalled)
+            if len(parsed_lines):
+                self.parsed_queue.put(parsed_lines)
 
     @staticmethod
     def parse_appsinstalled(line):
@@ -65,6 +58,35 @@ class ProcessedLine(Thread):
         except ValueError:
             logging.info("Invalid geo coords: `%s`" % line)
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
+
+
+class SenderToMemcThread(Thread):
+    def __init__(self, device_memc, queue, options=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.queue: Queue = queue
+        self.timeout = 3 if not options else options.timeout
+        self.device_memc = device_memc
+        self.retry = 1 if not options else options.retry
+        self.dry = False if not options else options.dry
+        self.processed = self.errors = 0
+
+    def run(self):
+        while True:
+            appsinstalleds = self.queue.get()
+            if isinstance(appsinstalleds, str) and appsinstalleds == "quit":
+                break
+            for appsinstalled in appsinstalleds:
+                memc = self.device_memc.get(appsinstalled.dev_type)
+                if not memc:
+                    self.errors += 1
+                    logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+                    continue
+                ok = SenderToMemcThread.insert_appsinstalled(memc, appsinstalled, self.dry, self.timeout, self.retry)
+                if ok:
+                    self.processed += 1
+                else:
+                    self.errors += 1
+            self.queue.task_done()
 
     @staticmethod
     def insert_appsinstalled(memc, appsinstalled, dry_run=False, timeout=3, retry_connection=3):
@@ -100,7 +122,8 @@ def dot_rename(path):
 
 
 def main(options):
-    queue = Queue()
+    raw_queue = Queue()
+    parsed_queue = Queue()
     device_memc = {
         "idfa": memcache.Client([options.idfa], socket_timeout=options.timeout),
         "gaid": memcache.Client([options.gaid], socket_timeout=options.timeout),
@@ -109,16 +132,16 @@ def main(options):
     }
     for fn in glob.iglob(options.pattern):
         logging.info('Processing %s' % fn)
-        workers = start_workers(device_memc, options, queue)
+        pipelines = start_pipeline(device_memc, options, raw_queue=raw_queue, parsed_queue=parsed_queue)
         fd = gzip.open(fn)
-        run_filler_thread(fd, queue)
-        for _ in workers:
-            queue.put('quit')
-        for w in workers:
+        run_filler_thread(fd, raw_queue)
+        for _ in pipelines.parsed_threads:
+            raw_queue.put('quit')
+        for w in itertools.chain(pipelines.parsed_threads, pipelines.sender_threads):
             w.join()
 
-        errors = sum(w.errors for w in workers)
-        processed = sum(w.processed for w in workers)
+        errors = sum(w.errors for w in itertools.chain(pipelines.parsed_threads, pipelines.sender_threads))
+        processed = sum(w.processed for w in pipelines.sender_threads)
         if not processed:
             fd.close()
             dot_rename(fn)
@@ -133,13 +156,16 @@ def main(options):
         dot_rename(fn)
 
 
-def start_workers(device_memc, options, queue):
-    workers = []
-    for _ in range(options.num_workers):
-        worker = ProcessedLine(device_memc, queue, options)
-        worker.start()
-        workers.append(worker)
-    return workers
+def start_pipeline(device_memc, options, raw_queue, parsed_queue):
+    pipelines = PipeLinesApps()
+    for num in range(options.num_workers):
+        parser_worker = ParseAppsLogThread(raw_queue, parsed_queue, name=f"parserThread-{num}")
+        sender_worker = SenderToMemcThread(device_memc, parsed_queue, options, name=f"senderThread-{num}")
+        parser_worker.start()
+        sender_worker.start()
+        pipelines.parsed_threads.append(parser_worker)
+        pipelines.sender_threads.append(sender_worker)
+    return pipelines
 
 
 def run_filler_thread(fd, queue):
@@ -164,10 +190,8 @@ def generate_chunk(fd, chunk_size=100):
         if len(lines) >= chunk_size:
             yield lines
             lines = []
-    yield lines
-
-
-
+    if lines:
+        yield lines
 
 def prototest():
     sample = "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"

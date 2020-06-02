@@ -3,6 +3,8 @@ from queue import Queue
 import memcache
 import pytest
 
+from memc_load import ParseAppsLogThread
+
 
 @pytest.fixture
 def sample():
@@ -10,14 +12,26 @@ def sample():
 
 
 @pytest.fixture
-def queue():
+def appsinstalled(sample):
+    return ParseAppsLogThread.parse_appsinstalled(sample.splitlines().pop())
+
+
+@pytest.fixture
+def empty_queue():
     return Queue()
 
 
 @pytest.fixture
-def sample_queue(sample, queue):
-    [queue.put([i]) for i in sample.splitlines()]
-    return queue
+def sample_queue(sample, empty_queue):
+    [empty_queue.put([i]) for i in sample.splitlines()]
+    return empty_queue
+
+
+@pytest.fixture
+def parsed_queue(appsinstalled, empty_queue):
+
+    [empty_queue.put([appsinstalled]) for i in range(10)]
+    return empty_queue
 
 
 @pytest.fixture
